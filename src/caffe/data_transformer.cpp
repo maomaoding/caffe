@@ -1,5 +1,9 @@
 #ifdef USE_OPENCV
 #include <opencv2/core/core.hpp>
+#include <opencv2/core/mat.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/opencv.hpp>
 #endif  // USE_OPENCV
 
 #include <string>
@@ -222,10 +226,111 @@ void DataTransformer<Dtype>::Transform(const vector<cv::Mat> & mat_vector,
   }
 }
 
+void rotate(cv::Mat& src, int angle) {
+  //get rotation matrix
+  cv::Point2f center(src.cols / 2.0, src.rows / 2.0);
+  cv::Mat rot = cv::getRotationMatrix2D(center, angle, 1.0);
+
+  cv::Rect bbox = cv::RotatedRect(center, src.size(), angle);
+
+  rot.at<double>(0, 2) += bbox.width / 2.0 - center.x;
+  rot.at<double>(1, 2) += bbox.height / 2.0 - center.y;
+  cv::warpAffine(src, src, rot, bbox.size());
+}
+
+void crop(cv::Mat& cv_img, int crop_size) {
+  int h_off = 0;
+  int w_off = 0;
+  const int img_height = cv_img.rows;
+  const int img_width = cv_img.cols;
+  h_off = (img_height - crop_size) / 2;
+  w_off = (img_width - crop_size) / 2;
+  cv::Rect roi(w_off, h_off, crop_size, crop_size);
+  cv_img = cv_img(roi);
+}
+
+void crop_center(cv::Mat& cv_img, int w, int h) {
+  int h_off = 0;
+  int w_off = 0;
+  const int img_height = cv_img.rows;
+  const int img_width = cv_img.cols;
+  h_off = (img_height - h) / 2;
+  w_off = (img_width - w) / 2;
+  cv::Rect roi(w_off, h_off, w, h);
+  cv_img = cv_img(roi);
+}
+
+void resize(cv::Mat& cv_img, int smallest_side) {
+  int cur_width = cv_img.cols;
+  int cur_height = cv_img.rows;
+  cv::Size dsize;
+  if (cur_height <= cur_width) {
+    double k = ((double)cur_height) / smallest_side;
+    int new_size = (int) ceil(cur_width / k);
+    dsize = cv::Size(new_size, smallest_side);
+  }
+  else {
+    double k = ((double)cur_width) / smallest_side;
+    int new_size = (int) ceil(cur_height / k);
+    dsize = cv::Size(smallest_side, new_size);
+  }
+  cv::resize(cv_img, cv_img, dsize);
+}
+
+void rotate_crop(cv::Mat& img, int degrees) {
+  double angle = degrees * (PI / 180.0);
+  int w = img.cols;
+  int h = img.rows;
+  if (w <= 0 || h <= 0)
+    return;
+
+  bool width_is_longer = w >= h;
+  double side_long, side_short;
+  if (width_is_longer) {
+    side_long = w;
+    side_short = h;
+  } else {
+    side_long = h;
+    side_short = w;
+  }
+  double sin_a = fabs(sin(angle));
+  double cos_a = fabs(cos(angle));
+  double wr, hr = 0;
+  if (side_short <= 2.*sin_a*cos_a*side_long) {
+    double x = 0.5*side_short;
+    if (width_is_longer) {
+      wr = x/sin_a;
+      hr = x/cos_a;
+    } else {
+      wr = x/cos_a;
+      hr = x/sin_a;
+    }
+  }
+  else {
+    double cos_2a = cos_a*cos_a - sin_a*sin_a;
+    wr = (w*cos_a - h*sin_a)/cos_2a;
+    hr = (h*cos_a - w*sin_a)/cos_2a;
+  }
+  rotate(img, degrees);
+  crop_center(img, (int)wr, (int)hr);
+}
+
 template<typename Dtype>
 void DataTransformer<Dtype>::Transform(const cv::Mat& cv_img,
                                        Blob<Dtype>* transformed_blob) {
+  const float small_ratio = param_.small_ratio();
   const int crop_size = param_.crop_size();
+  const int rotation_angle = param_.max_rotaion_angle();
+  const float min_contrast = param_.min_contrast();
+  const float max_contrast = param_.max_contrast();
+  const int max_brightness_shift = param_.max_brightness_shift();
+  const float max_smooth = param_.max_smooth();
+  const float max_zoomout_padding = param_.max_zoomout_padding();
+  const float apply_prob = 1.f - param_.apply_probability();
+  const bool debug_params = param_.debug_params();
+  const int max_horizontal_shift = param_.max_horizontal_shift();
+
+  
   const int img_channels = cv_img.channels();
   const int img_height = cv_img.rows;
   const int img_width = cv_img.cols;
@@ -247,6 +352,85 @@ void DataTransformer<Dtype>::Transform(const cv::Mat& cv_img,
   const bool do_mirror = param_.mirror() && Rand(2);
   const bool has_mean_file = param_.has_mean_file();
   const bool has_mean_values = mean_values_.size() > 0;
+
+  float current_prob;
+
+  const bool do_rotation = rotation_angle > 0 && phase_ == TRAIN;
+
+  const bool do_shift = max_horizontal_shift > 0 && phase_ == TRAIN;
+
+  caffe_rng_uniform(1, 0.f, 1.f, &current_prob);
+  const bool do_resize_to_small_ratio = small_ratio < 1 && phase_ == TRAIN && current_prob > apply_prob;
+
+  caffe_rng_uniform(1, 0.f, 1.f, &current_prob);
+  const bool do_brightness = param_.contrast_brightness_adjustment() && phase_ == TRAIN && current_prob > apply_prob;
+
+  caffe_rng_uniform(1, 0.f, 1.f, &current_prob);
+  const bool do_smooth = param_.smooth_filtering() && phase_ == TRAIN && max_smooth > 1 && current_prob > apply_prob;
+
+  caffe_rng_uniform(1, 0.f, 1.f, &current_prob);
+  const bool do_zoomout_padding = max_zoomout_padding > 0 && phase_ == TRAIN && current_prob > apply_prob;
+  
+  int current_angle = 0;
+  if (do_rotation) {
+    current_angle = Rand(rotation_angle*2 + 1) - rotation_angle;
+    if (current_angle)
+      rotate_crop(cv_img, current_angle);
+      cv::resize(cv_img, cv_img, cv::Size(height, width));
+  }
+
+  float ratio;
+  if (do_resize_to_small_ratio) {
+    caffe_rng_uniform(1, small_ratio, 1.f, &ratio);
+    int min_height = height * ratio;
+    int min_width = width * ratio;
+    cv::resize(cv_img, cv_img, cv::Size(min_height, min_width));
+    cv::resize(cv_img, cv_img, cv::Size(height, width));
+  }
+
+  float zoomout_ratio;
+  int ori_height = height;
+  int ori_width = width;
+  if (do_zoomout_padding) {
+    caffe_rng_uniform(1, 0.f, max_zoomout_padding, &zoomout_ratio);
+    int after_height = height*(1 - zoomout_ratio);
+    int after_width = width*(1 - zoomout_ratio);
+    cv::resize(cv_img, cv_img, cv::Size(after_height, after_width));
+    cv::copyMakeBorder(cv_img, cv_img, (ori_height - after_height) / 2, (ori_height - after_height) / 2,
+    (ori_width - after_width) / 2, (ori_width - after_width) / 2, cv::BORDER_CONSTANT);
+    cv::resize(cv_img, cv_img, cv::Size(height, width));
+  }
+
+  float alpha;
+  int beta;
+  if (do_brightness){
+      caffe_rng_uniform(1, min_contrast, max_contrast, &alpha);
+      beta = Rand(max_brightness_shift * 2 + 1) - max_brightness_shift;
+      cv_img.convertTo(cv_img, -1, alpha, beta);
+  }
+
+  int smooth_param = 0;
+  int smooth_type = 0;
+  if (do_smooth) {
+    smooth_type = Rand(4);
+    smooth_param = 1 + 2 * Rand(max_smooth/2);
+    switch (smooth_type) {
+        case 0:
+            cv::GaussianBlur(cv_img, cv_img, cv::Size(smooth_param, smooth_param), 0);
+            break;
+        case 1:
+            cv::blur(cv_img, cv_img, cv::Size(smooth_param, smooth_param));
+            break;
+        case 2:
+            cv::medianBlur(cv_img, cv_img, smooth_param);
+            break;
+        case 3:
+            cv::boxFilter(cv_img, cv_img, -1, cv::Size(smooth_param * 2, smooth_param * 2));
+            break;
+        default:
+            break;
+    }
+  }
 
   CHECK_GT(img_channels, 0);
   CHECK_GE(img_height, crop_size);
